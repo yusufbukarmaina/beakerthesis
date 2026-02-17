@@ -1,0 +1,204 @@
+"""
+Training script for Florence-2 on beaker volume detection.
+Fixed: proper fp16 handling and training configuration.
+"""
+import os
+import sys
+import importlib
+import json
+import torch
+import numpy as np
+from pathlib import Path
+from transformers import (
+    AutoProcessor,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer
+)
+from peft import LoraConfig, get_peft_model
+
+# Force reload to avoid stale kernel cache
+for mod_name in ['config', 'data_utils']:
+    if mod_name in sys.modules:
+        importlib.reload(sys.modules[mod_name])
+
+from config import *
+from data_utils import load_and_split_dataset, BeakerDataset, save_test_data
+
+torch.manual_seed(DATASET_SPLIT_SEED)
+np.random.seed(DATASET_SPLIT_SEED)
+
+
+class Florence2Trainer:
+
+    def __init__(self, output_dir: Path = FLORENCE_OUTPUT_DIR):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=" * 60)
+        print("Florence-2 Beaker Volume Detection Training")
+        print("=" * 60)
+
+        # ── Load processor ────────────────────────────────────────────────
+        print(f"\nLoading processor: {FLORENCE_MODEL_NAME}")
+        self.processor = AutoProcessor.from_pretrained(
+            FLORENCE_MODEL_NAME,
+            trust_remote_code=True
+        )
+
+        # ── Load model ────────────────────────────────────────────────────
+        print(f"Loading model: {FLORENCE_MODEL_NAME}")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            FLORENCE_MODEL_NAME,
+            torch_dtype=torch.bfloat16,  # Changed from float16 to bfloat16 for stability
+            trust_remote_code=True,
+            device_map="auto"
+        )
+
+        # ── Apply LoRA ────────────────────────────────────────────────────
+        print("Applying LoRA ...")
+        lora_cfg = LoraConfig(
+            r=LORA_CONFIG['r'],
+            lora_alpha=LORA_CONFIG['lora_alpha'],
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            lora_dropout=LORA_CONFIG['lora_dropout'],
+            bias=LORA_CONFIG['bias'],
+            task_type="CAUSAL_LM"
+        )
+        self.model = get_peft_model(self.model, lora_cfg)
+        self.model.print_trainable_parameters()
+
+        # ── Load dataset (metadata only — no images in RAM) ───────────────
+        print("\nLoading dataset (lazy mode — metadata only) ...")
+        self.splits = load_and_split_dataset()
+
+        # Save test images for demo (done once, lazily)
+        if not (TEST_DATA_DIR / "metadata.json").exists():
+            print("\nSaving test data for demo ...")
+            save_test_data(self.splits)
+        else:
+            print("\nTest data already saved, skipping.")
+
+        # ── Build PyTorch datasets ────────────────────────────────────────
+        print("\nBuilding PyTorch datasets ...")
+        self.train_dataset = BeakerDataset(
+            self.splits['train'],
+            self.processor,
+            FLORENCE_PROMPT_TEMPLATE,
+            model_type="florence"
+        )
+        self.val_dataset = BeakerDataset(
+            self.splits['validation'],
+            self.processor,
+            FLORENCE_PROMPT_TEMPLATE,
+            model_type="florence"
+        )
+        print(f"  Train      : {len(self.train_dataset)} samples")
+        print(f"  Validation : {len(self.val_dataset)} samples")
+
+    # ── Collate ───────────────────────────────────────────────────────────
+    def collate_fn(self, batch):
+        pixel_values   = torch.stack([b['pixel_values']   for b in batch])
+        input_ids      = torch.stack([b['input_ids']      for b in batch])
+        attention_mask = torch.stack([b['attention_mask'] for b in batch])
+        labels         = torch.stack([b['labels']         for b in batch])
+        return {
+            'pixel_values':   pixel_values,
+            'input_ids':      input_ids,
+            'attention_mask': attention_mask,
+            'labels':         labels,
+        }
+
+    # ── Train ─────────────────────────────────────────────────────────────
+    def train(self):
+        print("\n" + "=" * 60)
+        print("Starting Training")
+        print("=" * 60)
+
+        args = TrainingArguments(
+            output_dir=str(self.output_dir),
+            num_train_epochs=FLORENCE_CONFIG['num_epochs'],
+            per_device_train_batch_size=FLORENCE_CONFIG['batch_size'],
+            per_device_eval_batch_size=FLORENCE_CONFIG['batch_size'],
+            gradient_accumulation_steps=FLORENCE_CONFIG['gradient_accumulation_steps'],
+            learning_rate=FLORENCE_CONFIG['learning_rate'],
+            weight_decay=FLORENCE_CONFIG['weight_decay'],
+            warmup_steps=FLORENCE_CONFIG['warmup_steps'],
+            logging_dir=str(self.output_dir / "logs"),
+            logging_steps=FLORENCE_CONFIG['logging_steps'],
+            eval_strategy="steps",
+            eval_steps=FLORENCE_CONFIG['eval_steps'],
+            save_strategy="steps",
+            save_steps=FLORENCE_CONFIG['save_steps'],
+            save_total_limit=3,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            bf16=True,                    # Use bfloat16 instead of fp16
+            fp16=False,                   # Disable fp16
+            dataloader_num_workers=0,     # Avoid multiprocessing issues
+            remove_unused_columns=False,
+            report_to="tensorboard",
+            push_to_hub=False,
+            dataloader_pin_memory=False,
+            label_names=["labels"],
+        )
+
+        trainer = Trainer(
+            model=self.model,
+            args=args,
+            train_dataset=self.train_dataset,
+            eval_dataset=self.val_dataset,
+            data_collator=self.collate_fn,
+        )
+
+        print("\nTraining started ...")
+        print(f"  Total training steps: {len(self.train_dataset) // (args.per_device_train_batch_size * args.gradient_accumulation_steps) * args.num_train_epochs}")
+        print(f"  Effective batch size: {args.per_device_train_batch_size * args.gradient_accumulation_steps}")
+        
+        result = trainer.train()
+
+        print("\nSaving final model ...")
+        trainer.save_model(str(self.output_dir / "final_model"))
+        self.processor.save_pretrained(str(self.output_dir / "final_model"))
+
+        metrics = result.metrics
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+
+        summary = {
+            "model":           FLORENCE_MODEL_NAME,
+            "train_samples":   len(self.train_dataset),
+            "val_samples":     len(self.val_dataset),
+            "num_epochs":      FLORENCE_CONFIG['num_epochs'],
+            "learning_rate":   FLORENCE_CONFIG['learning_rate'],
+            "final_train_loss": metrics.get('train_loss'),
+        }
+        with open(self.output_dir / "training_summary.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        print("\n" + "=" * 60)
+        print("Training complete!")
+        print(f"Model saved to: {self.output_dir / 'final_model'}")
+        print("=" * 60)
+        return trainer
+
+
+def main():
+    if torch.cuda.is_available():
+        print(f"GPU : {torch.cuda.get_device_name(0)}")
+        print(f"RAM : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("WARNING: No GPU detected!")
+
+    trainer = Florence2Trainer()
+    trainer.train()
+
+    print("\n✓ Florence-2 training complete!")
+    print(f"  Checkpoint : {FLORENCE_OUTPUT_DIR / 'final_model'}")
+    print(f"  Test data  : {TEST_DATA_DIR}")
+    print("\nNext: python3 train_qwen.py")
+
+
+if __name__ == "__main__":
+    main()
