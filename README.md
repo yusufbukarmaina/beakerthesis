@@ -26,7 +26,7 @@ pip install -r requirements.txt
 
 ### 2. Data Preparation
 ```bash
-python data_utils.py
+python data_utils1.py
 ```
 
 This will:
@@ -38,12 +38,12 @@ This will:
 
 **Train Florence-2:**
 ```bash
-python train_florence.py
+python train_florence1.py
 ```
 
 **Train Qwen2-VL:**
 ```bash
-python train_qwen.py
+python train_qwen1.py
 ```
 
 Models will be saved to:
@@ -52,7 +52,7 @@ Models will be saved to:
 
 ### 4. Evaluation
 ```bash
-python evaluate.py
+python evaluate1.py
 ```
 
 This generates:
@@ -66,7 +66,7 @@ Results saved to `outputs/results/`
 
 **Launch Gradio Interface:**
 ```bash
-python demo.py
+python demo1.py
 ```
 
 **Single Image Inference:**
@@ -246,4 +246,5 @@ data/
 Thumbs.db
 
 # HuggingFace cache
+
 .cache/
