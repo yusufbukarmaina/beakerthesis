@@ -52,7 +52,7 @@ class Florence2Trainer:
             FLORENCE_MODEL_NAME,
             torch_dtype=torch.bfloat16,  # Changed from float16 to bfloat16 for stability
             trust_remote_code=True,
-            device_map="auto"
+            device_map="cuda:0"
         )
 
         # ── Apply LoRA ────────────────────────────────────────────────────
