@@ -21,7 +21,7 @@ from huggingface_hub import HfApi, create_repo, login
 # ─────────────────────────────────────────────────────────────────────────────
 # ✏️  EDIT THESE TWO LINES WITH YOUR OWN VALUES
 # ─────────────────────────────────────────────────────────────────────────────
-HF_TOKEN    = "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # paste your HF write token here
+HF_TOKEN    = "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"  # paste your HF write token here
 HF_USERNAME = "yusufbukarmaina"                        # your HF username
 # ─────────────────────────────────────────────────────────────────────────────
 
